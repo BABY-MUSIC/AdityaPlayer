@@ -19,6 +19,25 @@ from youtubesearchpython.__future__ import VideosSearch
 
 
 
+import os
+
+# Create OS-level pipe
+r_fd, w_fd = os.pipe()
+
+# Run ffmpeg writing raw audio into our pipe
+process = await asyncio.create_subprocess_exec(
+    "ffmpeg",
+    "-re",
+    "-i", cdn_url,
+    "-f", "s16le",
+    "-ac", "2",
+    "-ar", "48000",
+    "pipe:1",
+    stdout=w_fd,
+    stderr=subprocess.DEVNULL
+)
+
+
 def parse_query(query: str) -> str:
     if bool(re.match(r'^(https?://)?(www\.)?(youtube\.com|youtu\.be)/(?:watch\?v=|embed/|v/|shorts/|live/)?([A-Za-z0-9_-]{11})(?:[?&].*)?$', query)):
         match = re.search(r'(?:v=|\/(?:embed|v|shorts|live)\/|youtu\.be\/)([A-Za-z0-9_-]{11})', query)
@@ -490,7 +509,7 @@ async def start_stream_in_vc(client, message):
 
         # ✅ Use ExternalMedia wrapper (needed for pipe object)
         media_stream = MediaStream(
-            media_path=ExternalMedia(process.stdout.fileno()),
+            media_path=ExternalMedia(r_fd),
             audio_parameters=AudioQuality.HIGH,
             video_flags=MediaStream.Flags.IGNORE,
         )
@@ -558,4 +577,5 @@ async def start_stream_in_vc(client, message):
         )
     except Exception as e:
         print(f"Thumbnail error: {e}")
+
 

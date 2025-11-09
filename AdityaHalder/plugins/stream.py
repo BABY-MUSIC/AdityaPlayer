@@ -37,20 +37,37 @@ def parse_tg_link(link: str):
         
     return None, None
 
-
 async def fetch_song(query: str):
-    url = "http://82.180.147.88:1470/song"
-    params = {"query": query}
+    try:
+        # Step 1: Search video on YouTube
+        search = VideosSearch(query, limit=1)
+        result = (await search.next()).get("result", [])
 
-    async with aiohttp.ClientSession() as session:
-        async with session.get(url, params=params) as response:
-            if response.status == 200:
-                try:
-                    return await response.json()
-                except Exception:
-                    return {}
-                
-            return {}
+        if not result:
+            return {"error": "No video found"}
+
+        # Step 2: Extract video ID
+        vidid = result[0].get("id")
+        if not vidid:
+            return {"error": "Failed to get video ID"}
+
+        # Step 3: Call API using video ID
+        url = "http://82.180.147.88:1470/song"
+        params = {"query": vidid}
+
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, params=params) as response:
+                if response.status == 200:
+                    try:
+                        return await response.json()
+                    except Exception:
+                        return {"error": "Invalid JSON response"}
+                else:
+                    return {"error": f"API returned status {response.status}"}
+
+    except Exception as e:
+        return {"error": str(e)}
+
 
 def convert_to_seconds(duration: str) -> int:
     parts = list(map(int, duration.split(":")))
@@ -461,10 +478,10 @@ async def start_stream_in_vc(client, message):
 
         # 🔹 Fetch Telegram song link from API
         song_data = await fetch_song(query)
-        if not song_data or "telegram_link" not in song_data:
+        if not song_data or "link" not in song_data:
             return await aux.edit("❌ Song not found in Telegram database.")
 
-        song_url = song_data["telegram_link"]
+        song_url = song_data["link"]
 
         # 🎧 Step 1: Stream directly from Telegram (instant)
         await aux.edit("**🎧 Streaming instantly... please wait ✨**")
@@ -594,6 +611,7 @@ async def start_stream_in_vc(client, message):
             await bot.send_photo(console.LOG_GROUP_ID, photo=thumbnail, caption=log_message)
         except Exception:
             pass
+
 
 
 

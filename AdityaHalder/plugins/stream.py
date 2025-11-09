@@ -18,7 +18,7 @@ from pytgcalls.types import AudioQuality, VideoQuality
 from youtubesearchpython.__future__ import VideosSearch
 
 
-
+import tempfile
 import os
 
 
@@ -482,26 +482,18 @@ async def start_stream_in_vc(client, message):
 
         await aux.edit("**🎶 Starting live stream...**")
 
-        # ✅ Create OS-level pipe for ffmpeg → VC
-        r_fd, w_fd = os.pipe()
 
-        process = await asyncio.create_subprocess_exec(
-            "ffmpeg",
-            "-re",
-            "-i", cdn_url,
-            "-f", "s16le",
-            "-ac", "2",
-            "-ar", "48000",
-            "pipe:1",
-            stdout=w_fd,
-            stderr=subprocess.DEVNULL,
+        temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".pcm")
+        await asyncio.create_subprocess_exec(
+            "ffmpeg", "-y", "-re", "-i", cdn_url,
+            "-f", "s16le", "-ac", "2", "-ar", "48000",
+            temp_file.name
         )
-
-        os.close(w_fd)  # close write end in Python (ffmpeg uses it)
+  # close write end in Python (ffmpeg uses it)
 
         # ✅ Use read-end fd for VC input
         media_stream = MediaStream(
-            media_path=ExternalMedia(r_fd),
+            media_path=temp_file.name,
             audio_parameters=AudioQuality.HIGH,
             video_flags=MediaStream.Flags.IGNORE,
         )
@@ -571,4 +563,5 @@ async def start_stream_in_vc(client, message):
         )
     except Exception as e:
         print(f"Thumbnail error: {e}")
+
 

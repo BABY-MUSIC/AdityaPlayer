@@ -13,7 +13,7 @@ from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 
 from ntgcalls import TelegramServerError
 from pytgcalls.exceptions import NoActiveGroupCall
-from pytgcalls.types import MediaStream
+from pytgcalls.types import MediaStream, ExternalMedia
 from pytgcalls.types import AudioQuality, VideoQuality
 from youtubesearchpython.__future__ import VideosSearch
 
@@ -406,12 +406,11 @@ async def start_stream_in_vc(client, message):
         if message.from_user
         else f"[Anonymous User](https://t.me/{bot.username})"
     )
-
     replied = message.reply_to_message
     audio_telegram = replied.audio or replied.voice if replied else None
     video_telegram = replied.video or replied.document if replied else None
 
-    # ✅ Case 1: Replied Telegram media (already uploaded)
+    # ✅ Case 1: Directly replied media
     if audio_telegram or video_telegram:
         aux = await message.reply_text("**🔄 Processing replied media...**")
         msg_media = audio_telegram or video_telegram
@@ -424,11 +423,11 @@ async def start_stream_in_vc(client, message):
         image_path = "AdityaHalder/resource/thumbnail.png"
 
         media_stream = (
-            MediaStream(media_path=file_id, audio_parameters=AudioQuality.STUDIO)
+            MediaStream(media_path=file_id, audio_parameters=AudioQuality.HIGH)
             if not video_stream
             else MediaStream(
                 media_path=file_id,
-                audio_parameters=AudioQuality.STUDIO,
+                audio_parameters=AudioQuality.HIGH,
                 video_parameters=VideoQuality.HD_720p,
             )
         )
@@ -439,7 +438,7 @@ async def start_stream_in_vc(client, message):
         except Exception as e:
             return await aux.edit(f"❌ Failed to start stream: `{e}`")
 
-    # ✅ Case 2: /play query → Use API + Telegram public link
+    # ✅ Case 2: /play query → Fetch link from API (no download)
     else:
         if len(message.command) < 2:
             return await message.reply_text(
@@ -447,10 +446,10 @@ async def start_stream_in_vc(client, message):
             )
 
         query = " ".join(message.command[1:])
-        aux = await message.reply_text("**🔍 Fetching from API...**")
+        aux = await message.reply_text("**🔍 Fetching song link from API...**")
         video_stream = message.command[0].startswith("v")
 
-        # 🔹 Fetch from your API
+        # 🔹 Get Telegram link from your API
         song_data = await fetch_song(query)
         if not song_data or "link" not in song_data:
             return await aux.edit("❌ Song not found in Telegram database.")
@@ -463,7 +462,7 @@ async def start_stream_in_vc(client, message):
 
         await aux.edit("**🎧 Resolving Telegram CDN...**")
 
-        # 🔁 Convert t.me link → actual Telegram CDN URL
+        # 🔁 Convert t.me → Telegram CDN link
         async def resolve_tgcdn(link):
             async with aiohttp.ClientSession() as s:
                 async with s.get(link, allow_redirects=True) as r:
@@ -475,9 +474,9 @@ async def start_stream_in_vc(client, message):
         except Exception as e:
             return await aux.edit(f"❌ Failed to resolve Telegram CDN: `{e}`")
 
-        await aux.edit("**🎶 Starting Telegram stream...**")
+        await aux.edit("**🎶 Preparing FFmpeg live stream...**")
 
-        # ✅ Create FFmpeg pipe → real sound in VC
+        # ✅ FFmpeg pipe: converts CDN file → PCM audio
         async def create_audio_pipe(url):
             process = await asyncio.create_subprocess_exec(
                 'ffmpeg', '-re', '-i', url,
@@ -489,9 +488,9 @@ async def start_stream_in_vc(client, message):
 
         process = await create_audio_pipe(cdn_url)
 
-        # ✅ Create MediaStream using ffmpeg stdout pipe
+        # ✅ Use ExternalMedia wrapper (needed for pipe object)
         media_stream = MediaStream(
-            media_path=process.stdout,
+            media_path=ExternalMedia(process.stdout),
             audio_parameters=AudioQuality.HIGH,
             video_flags=MediaStream.Flags.IGNORE,
         )
@@ -505,7 +504,7 @@ async def start_stream_in_vc(client, message):
             process.kill()
             return await aux.edit(f"❌ Failed to start stream: `{type(e).__name__}: {e}`")
 
-        # background monitor for cleanup
+        # 🔁 Keep monitoring FFmpeg pipe
         async def monitor_pipe():
             while True:
                 if process.poll() is not None:
@@ -516,7 +515,7 @@ async def start_stream_in_vc(client, message):
 
         asyncio.create_task(monitor_pipe())
 
-    # ✅ Continue with queue + thumbnail
+    # ✅ Thumbnail + queue system
     try:
         image_file = await generate_thumbnail(image_path)
         thumbnail = await make_thumbnail(
@@ -559,6 +558,3 @@ async def start_stream_in_vc(client, message):
         )
     except Exception as e:
         print(f"Thumbnail error: {e}")
-
-
-

@@ -390,12 +390,6 @@ async def generate_thumbnail(url: str) -> str:
 async def make_thumbnail(image, title, channel, duration, output):
     return await create_music_thumbnail(image, title, channel, duration, output)
 
-import aiohttp
-import asyncio
-import subprocess
-from ntgcalls import MediaStream, AudioQuality, VideoQuality
-from pyrogram import filters
-from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 
 @bot.on_message(cdz(["play", "vplay"]) & ~filters.private)
 async def start_stream_in_vc(client, message):
@@ -563,4 +557,5 @@ async def start_stream_in_vc(client, message):
         )
     except Exception as e:
         print(f"Thumbnail error: {e}")
+
 

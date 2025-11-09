@@ -390,7 +390,6 @@ async def generate_thumbnail(url: str) -> str:
 async def make_thumbnail(image, title, channel, duration, output):
     return await create_music_thumbnail(image, title, channel, duration, output)
 
-
 @bot.on_message(cdz(["play", "vplay"]) & ~filters.private)
 async def start_stream_in_vc(client, message):
     try:
@@ -411,35 +410,11 @@ async def start_stream_in_vc(client, message):
     # ✅ Case 1: If replied to Telegram audio/video
     if audio_telegram or video_telegram:
         aux = await message.reply_text("**🔄 Processing ✨...**")
-        if audio_telegram:
-            id = audio_telegram.file_unique_id
-            full_title = getattr(audio_telegram, "title", None) or getattr(audio_telegram, "file_name", None) or "Telegram Audio"
-            ext = (
-                (getattr(audio_telegram, "file_name", "").split(".")[-1])
-                if hasattr(audio_telegram, "file_name") and audio_telegram.file_name and "." in audio_telegram.file_name
-                else "ogg"
-            )
-            file_name = f"{id}.{ext}"
-            duration_sec = getattr(audio_telegram, "duration", 0) or 0
-            video_stream = False
-        else:
-            id = video_telegram.file_unique_id
-            full_title = getattr(video_telegram, "title", None) or getattr(video_telegram, "file_name", None) or "Telegram Video"
-            ext = (
-                (getattr(video_telegram, "file_name", "").split(".")[-1])
-                if hasattr(video_telegram, "file_name") and video_telegram.file_name and "." in video_telegram.file_name
-                else "mp4"
-            )
-            file_name = f"{id}.{ext}"
-            duration_sec = getattr(video_telegram, "duration", 0) or 0
-            video_stream = True
-
-        file_path = os.path.join("downloads", file_name)
-        if not os.path.exists(file_path):
-            await aux.edit("**⬇️ Downloading from Telegram ✨...**")
-            await replied.download(file_name=file_path)
-
-        title = full_title[:30]
+        msg_media = audio_telegram or video_telegram
+        file_path = msg_media.file_id  # direct stream from Telegram file_id
+        video_stream = True if video_telegram else False
+        full_title = getattr(msg_media, "file_name", "Telegram Media")
+        duration_sec = getattr(msg_media, "duration", 0)
         image_path = "AdityaHalder/resource/thumbnail.png"
         link = replied.link
         channel = message.chat.title
@@ -449,7 +424,7 @@ async def start_stream_in_vc(client, message):
             else "Telegram"
         )
 
-    # ✅ Case 2: /play query
+    # ✅ Case 2: /play query → use API to get Telegram public link
     else:
         if len(message.command) < 2:
             return await message.reply_text(
@@ -457,135 +432,95 @@ async def start_stream_in_vc(client, message):
             )
 
         query = parse_query(" ".join(message.command[1:]))
-        aux = await message.reply_text("**🔍 Searching...**")
-        # user intent (video/audio), lekin actual media se override kar denge niche
-        video_stream = True if message.command[0].startswith("v") else False
+        aux = await message.reply_text("**🔍 Fetching song link...**")
+        video_stream = message.command[0].startswith("v")
 
-        search = VideosSearch(query, limit=1)
-        result = (await search.next())["result"]
-        if not result:
-            return await aux.edit("❌ No results found.")
-
-        video = result[0]
-        full_title = video["title"]
-        id = video["id"]
-        duration = video["duration"]
-        if not duration:
-            return await aux.edit("❌ Live streams can't be played right now.")
-        duration_sec = convert_to_seconds(duration)
-        duration_mins = format_duration(duration_sec)
-        image_path = video["thumbnails"][0]["url"].split("?")[0]
-        channellink = video["channel"]["link"]
-        channel = video["channel"]["name"]
-        link = video["link"]
-        title = full_title[:30]
-        xyz = os.path.join("downloads", f"{id}.mp3")
-
-        # 🔹 Fetch Telegram song link from API (uses only 'link')
+        # 🔹 Fetch Telegram public link from API
         song_data = await fetch_song(query)
         if not song_data or "link" not in song_data:
             return await aux.edit("❌ Song not found in Telegram database.")
 
-        song_url = song_data["link"]  # e.g., https://t.me/BabyYTapi/19321
+        song_link = song_data["link"]        # e.g. https://t.me/BabyYTapi/19321
+        vidid = song_data.get("vidid", "unknown")
+        full_title = f"{vidid}.mp3"
+        link = song_link
+        channel = "Telegram Channel"
+        channellink = song_link
+        image_path = "AdityaHalder/resource/thumbnail.png"
+        duration_sec = 0
 
-        # 🎧 Step 1: Stream directly from Telegram (instant)
-        await aux.edit("**🎧 Streaming instantly... please wait ✨**")
+        await aux.edit("**🎧 Streaming directly from Telegram CDN...**")
 
         try:
-            c_username, message_id = parse_tg_link(song_url)
-            msg = await client.get_messages(c_username, int(message_id))
-
-            # 🔒 Detect actual media & override video_stream safely
-            file_id = None
-            # Priority order: audio, voice, video, document (mp3/mp4)
-            if getattr(msg, "audio", None):
-                file_id = msg.audio.file_id
-                duration_sec = getattr(msg.audio, "duration", duration_sec) or duration_sec
-                video_stream = False
-            elif getattr(msg, "voice", None):
-                file_id = msg.voice.file_id
-                duration_sec = getattr(msg.voice, "duration", duration_sec) or duration_sec
-                video_stream = False
-            elif getattr(msg, "video", None):
-                file_id = msg.video.file_id
-                duration_sec = getattr(msg.video, "duration", duration_sec) or duration_sec
-                video_stream = True
-            elif getattr(msg, "document", None):
-                file_id = msg.document.file_id
-                # document duration usually not present; keep previous duration_sec
-                # try to infer by mime
-                mime = getattr(msg.document, "mime_type", "") or ""
-                if "video" in mime:
-                    video_stream = True
-                else:
-                    video_stream = False
-            else:
-                return await aux.edit("❌ Unsupported or invalid Telegram file in the provided link.")
-
-            # Build media_stream from Telegram file_id (instant)
+            # Direct stream from Telegram link (no download)
             media_stream = (
                 MediaStream(
-                    media_path=file_id,
+                    media_path=song_link,
                     audio_parameters=AudioQuality.STUDIO,
                 )
                 if not video_stream
                 else MediaStream(
-                    media_path=file_id,
+                    media_path=song_link,
                     audio_parameters=AudioQuality.STUDIO,
                     video_parameters=VideoQuality.HD_720p,
                 )
             )
 
-            try:
-                await call.start_stream(chat_id, media_stream)
-                await aux.edit("**🎧 Streaming started — downloading locally...**")
-            except NoActiveGroupCall:
-                return await aux.edit("❌ No active VC found to stream.")
-            except TelegramServerError:
-                return await aux.edit("⚠️ Telegram server error, try again shortly.")
-            except Exception as se:
-                # extra context for debugging
-                return await aux.edit(f"❌ Failed to start stream: `{type(se).__name__}: {se}`")
+            await call.start_stream(chat_id, media_stream)
+            await aux.edit(f"**🎶 Streaming Started!**\n📡 From: [Telegram Link]({song_link})")
+        except NoActiveGroupCall:
+            return await aux.edit("❌ No active VC found to stream.")
+        except TelegramServerError:
+            return await aux.edit("⚠️ Telegram server error, try again shortly.")
         except Exception as e:
-            return await aux.edit(f"❌ Failed to start stream: `{type(e).__name__}: {e}`")
+            return await aux.edit(f"❌ Failed to start stream:\n`{type(e).__name__}: {e}`")
 
-        # 🎵 Step 2: Sequential file download (no background / futures)
-        try:
-            await msg.download(file_name=xyz)
-            print(f"✅ Downloaded successfully: {xyz}")
-        except Exception as e:
-            print(f"⚠️ Download failed: {e}")
+    # ✅ Continue same thumbnail, queue, caption logic
+    image_file = await generate_thumbnail(image_path)
+    thumbnail = await make_thumbnail(
+        image_file,
+        full_title,
+        channel,
+        duration_sec,
+        f"cache/{chat_id}_{message.id}.png",
+    )
 
-        file_path = xyz
-
-    # ✅ Continue with queue system & thumbnail (unchanged logic)
+    title = full_title[:30]
     media_stream = (
         MediaStream(
-            media_path=file_path,
+            media_path=link,
             video_flags=MediaStream.Flags.IGNORE,
             audio_parameters=AudioQuality.STUDIO,
         )
         if not video_stream
         else MediaStream(
-            media_path=file_path,
+            media_path=link,
             audio_parameters=AudioQuality.STUDIO,
             video_parameters=VideoQuality.HD_720p,
         )
     )
 
-    image_file = await generate_thumbnail(image_path)
-    thumbnail = await make_thumbnail(
-        image_file, full_title, channel, duration_sec, f"cache/{chat_id}_{id}_{message.id}.png"
+    pos = await call.add_to_queue(
+        chat_id,
+        media_stream,
+        title,
+        format_duration(duration_sec),
+        thumbnail,
+        mention,
     )
 
-    pos = await call.add_to_queue(chat_id, media_stream, title, format_duration(duration_sec), thumbnail, mention)
-    status = "✅ **Started Streaming in VC.**" if pos == 0 else f"✅ **Added To Queue At: #{pos}**"
+    status = (
+        "✅ **Started Streaming in VC.**"
+        if pos == 0
+        else f"✅ **Added To Queue At: #{pos}**"
+    )
     caption = f"""
 {status}
 
-**❍ Title:** [{title}...]({link})
-**❍ Duration:** {format_duration(duration_sec)}
-**❍ Requested By:** {mention}"""
+**❍ Title:** `{title}`
+**❍ Requested By:** {mention}
+**❍ Source:** [Telegram Link]({link})
+"""
 
     buttons = InlineKeyboardMarkup(
         [[InlineKeyboardButton(text="🗑️ Close", callback_data="close")]]
@@ -593,42 +528,29 @@ async def start_stream_in_vc(client, message):
 
     try:
         await aux.delete()
-        await message.reply_photo(photo=thumbnail, caption=caption, has_spoiler=True, reply_markup=buttons)
+        await message.reply_photo(
+            photo=thumbnail,
+            caption=caption,
+            has_spoiler=True,
+            reply_markup=buttons,
+        )
     except:
         pass
 
     if chat_id != console.LOG_GROUP_ID:
         try:
             chat_name = message.chat.title
-            if message.chat.username:
-                chat_link = f"@{message.chat.username}"
-            elif chat_id in console.chat_links:
-                clink = console.chat_links[chat_id]
-                chat_link = f"[Private Chat]({clink})"
-            else:
-                try:
-                    new_link = await client.export_chat_invite_link(chat_id)
-                    console.chat_links[chat_id] = new_link
-                    chat_link = f"[Private Chat]({new_link})"
-                except Exception:
-                    chat_link = "N/A"
+            chat_link = (
+                f"@{message.chat.username}"
+                if message.chat.username
+                else f"[Private Chat]({await client.export_chat_invite_link(chat_id)})"
+            )
 
-            if message.from_user:
-                if message.from_user.username:
-                    req_user = f"@{message.from_user.username}"
-                else:
-                    req_user = message.from_user.mention
-                user_id = message.from_user.id
-            elif message.sender_chat:
-                if message.sender_chat.username:
-                    req_user = f"@{message.sender_chat.username}"
-                else:
-                    req_user = message.sender_chat.title
-                user_id = message.sender_chat.id
-            else:
-                req_user = "Anonymous User"
-                user_id = "N/A"
-
+            req_user = (
+                f"@{message.from_user.username}"
+                if message.from_user and message.from_user.username
+                else mention
+            )
             stream_type = "Audio" if not video_stream else "Video"
 
             log_message = f"""
@@ -636,13 +558,15 @@ async def start_stream_in_vc(client, message):
 
 📍 **Chat:** {chat_name}
 💬 **Chat Link:** {chat_link}
-♂️ **Chat ID:** {chat_id}
 👤 **Requested By:** {req_user}
-🆔 **User ID:** `{user_id}`
 🔎 **Query:** {query}
-🎶 **Title:** [{title}...]({link})
-⏱️ **Duration:** {format_duration(duration_sec)}
-📡 **Stream Type:** {stream_type}"""
-            await bot.send_photo(console.LOG_GROUP_ID, photo=thumbnail, caption=log_message)
+🎶 **Title:** `{title}`
+📡 **Source:** [Telegram Link]({link})
+📡 **Stream Type:** {stream_type}
+"""
+            await bot.send_photo(
+                console.LOG_GROUP_ID, photo=thumbnail, caption=log_message
+            )
         except Exception:
             pass
+

@@ -413,21 +413,25 @@ async def start_stream_in_vc(client, message):
         aux = await message.reply_text("**🔄 Processing ✨...**")
         if audio_telegram:
             id = audio_telegram.file_unique_id
-            full_title = audio_telegram.title or audio_telegram.file_name
+            full_title = getattr(audio_telegram, "title", None) or getattr(audio_telegram, "file_name", None) or "Telegram Audio"
             ext = (
-                (audio_telegram.file_name.split(".")[-1])
-                if hasattr(audio_telegram, "file_name")
+                (getattr(audio_telegram, "file_name", "").split(".")[-1])
+                if hasattr(audio_telegram, "file_name") and audio_telegram.file_name and "." in audio_telegram.file_name
                 else "ogg"
             )
             file_name = f"{id}.{ext}"
-            duration_sec = audio_telegram.duration
+            duration_sec = getattr(audio_telegram, "duration", 0) or 0
             video_stream = False
         else:
             id = video_telegram.file_unique_id
-            full_title = video_telegram.title or video_telegram.file_name
-            ext = (video_telegram.file_name.split(".")[-1])
+            full_title = getattr(video_telegram, "title", None) or getattr(video_telegram, "file_name", None) or "Telegram Video"
+            ext = (
+                (getattr(video_telegram, "file_name", "").split(".")[-1])
+                if hasattr(video_telegram, "file_name") and video_telegram.file_name and "." in video_telegram.file_name
+                else "mp4"
+            )
             file_name = f"{id}.{ext}"
-            duration_sec = video_telegram.duration
+            duration_sec = getattr(video_telegram, "duration", 0) or 0
             video_stream = True
 
         file_path = os.path.join("downloads", file_name)
@@ -454,6 +458,7 @@ async def start_stream_in_vc(client, message):
 
         query = parse_query(" ".join(message.command[1:]))
         aux = await message.reply_text("**🔍 Searching...**")
+        # user intent (video/audio), lekin actual media se override kar denge niche
         video_stream = True if message.command[0].startswith("v") else False
 
         search = VideosSearch(query, limit=1)
@@ -476,12 +481,12 @@ async def start_stream_in_vc(client, message):
         title = full_title[:30]
         xyz = os.path.join("downloads", f"{id}.mp3")
 
-        # 🔹 Fetch Telegram song link from API
+        # 🔹 Fetch Telegram song link from API (uses only 'link')
         song_data = await fetch_song(query)
         if not song_data or "link" not in song_data:
             return await aux.edit("❌ Song not found in Telegram database.")
 
-        song_url = song_data["link"]
+        song_url = song_data["link"]  # e.g., https://t.me/BabyYTapi/19321
 
         # 🎧 Step 1: Stream directly from Telegram (instant)
         await aux.edit("**🎧 Streaming instantly... please wait ✨**")
@@ -490,14 +495,42 @@ async def start_stream_in_vc(client, message):
             c_username, message_id = parse_tg_link(song_url)
             msg = await client.get_messages(c_username, int(message_id))
 
+            # 🔒 Detect actual media & override video_stream safely
+            file_id = None
+            # Priority order: audio, voice, video, document (mp3/mp4)
+            if getattr(msg, "audio", None):
+                file_id = msg.audio.file_id
+                duration_sec = getattr(msg.audio, "duration", duration_sec) or duration_sec
+                video_stream = False
+            elif getattr(msg, "voice", None):
+                file_id = msg.voice.file_id
+                duration_sec = getattr(msg.voice, "duration", duration_sec) or duration_sec
+                video_stream = False
+            elif getattr(msg, "video", None):
+                file_id = msg.video.file_id
+                duration_sec = getattr(msg.video, "duration", duration_sec) or duration_sec
+                video_stream = True
+            elif getattr(msg, "document", None):
+                file_id = msg.document.file_id
+                # document duration usually not present; keep previous duration_sec
+                # try to infer by mime
+                mime = getattr(msg.document, "mime_type", "") or ""
+                if "video" in mime:
+                    video_stream = True
+                else:
+                    video_stream = False
+            else:
+                return await aux.edit("❌ Unsupported or invalid Telegram file in the provided link.")
+
+            # Build media_stream from Telegram file_id (instant)
             media_stream = (
                 MediaStream(
-                    media_path=msg.audio.file_id,
+                    media_path=file_id,
                     audio_parameters=AudioQuality.STUDIO,
                 )
                 if not video_stream
                 else MediaStream(
-                    media_path=msg.video.file_id,
+                    media_path=file_id,
                     audio_parameters=AudioQuality.STUDIO,
                     video_parameters=VideoQuality.HD_720p,
                 )
@@ -510,8 +543,11 @@ async def start_stream_in_vc(client, message):
                 return await aux.edit("❌ No active VC found to stream.")
             except TelegramServerError:
                 return await aux.edit("⚠️ Telegram server error, try again shortly.")
+            except Exception as se:
+                # extra context for debugging
+                return await aux.edit(f"❌ Failed to start stream: `{type(se).__name__}: {se}`")
         except Exception as e:
-            return await aux.edit(f"❌ Failed to start stream: `{e}`")
+            return await aux.edit(f"❌ Failed to start stream: `{type(e).__name__}: {e}`")
 
         # 🎵 Step 2: Sequential file download (no background / futures)
         try:
@@ -522,7 +558,7 @@ async def start_stream_in_vc(client, message):
 
         file_path = xyz
 
-    # ✅ Continue with queue system & thumbnail
+    # ✅ Continue with queue system & thumbnail (unchanged logic)
     media_stream = (
         MediaStream(
             media_path=file_path,
@@ -576,7 +612,6 @@ async def start_stream_in_vc(client, message):
                     chat_link = f"[Private Chat]({new_link})"
                 except Exception:
                     chat_link = "N/A"
-        
 
             if message.from_user:
                 if message.from_user.username:
@@ -606,30 +641,8 @@ async def start_stream_in_vc(client, message):
 🆔 **User ID:** `{user_id}`
 🔎 **Query:** {query}
 🎶 **Title:** [{title}...]({link})
-⏱️ **Duration:** {duration_mins}
+⏱️ **Duration:** {format_duration(duration_sec)}
 📡 **Stream Type:** {stream_type}"""
             await bot.send_photo(console.LOG_GROUP_ID, photo=thumbnail, caption=log_message)
         except Exception:
             pass
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-

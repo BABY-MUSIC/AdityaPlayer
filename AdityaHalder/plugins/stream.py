@@ -490,7 +490,7 @@ async def start_stream_in_vc(client, message):
 
         # ✅ Use ExternalMedia wrapper (needed for pipe object)
         media_stream = MediaStream(
-            media_path=ExternalMedia(process.stdout),
+            media_path=ExternalMedia(process.stdout.fileno()),
             audio_parameters=AudioQuality.HIGH,
             video_flags=MediaStream.Flags.IGNORE,
         )
@@ -558,3 +558,4 @@ async def start_stream_in_vc(client, message):
         )
     except Exception as e:
         print(f"Thumbnail error: {e}")
+

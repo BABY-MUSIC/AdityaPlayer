@@ -3,6 +3,8 @@ import aiofiles, aiohttp, base64, json, os, random, re, requests
 from .. import app, bot, call, cdz, console
 from urllib.parse import urlparse
 from io import BytesIO
+import asyncio
+import subprocess
 
 from PIL import Image, ImageDraw, ImageFont, ImageFilter
 
@@ -557,5 +559,6 @@ async def start_stream_in_vc(client, message):
         )
     except Exception as e:
         print(f"Thumbnail error: {e}")
+
 
 

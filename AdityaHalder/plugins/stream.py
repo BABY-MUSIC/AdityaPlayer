@@ -508,17 +508,6 @@ async def start_stream_in_vc(client, message):
             os.close(r_fd)
             return await aux.edit(f"❌ Failed to start stream: `{type(e).__name__}: {e}`")
 
-        # 🧹 keep ffmpeg pipe monitored
-        async def monitor_pipe():
-            while True:
-                if process.poll() is not None:
-                    print("⚠️ FFmpeg exited — stopping VC stream.")
-                    await call.stop_stream(chat_id)
-                    os.close(r_fd)
-                    break
-                await asyncio.sleep(5)
-
-        asyncio.create_task(monitor_pipe())
 
     # ✅ QUEUE + THUMBNAIL SYSTEM
     try:
@@ -563,5 +552,6 @@ async def start_stream_in_vc(client, message):
         )
     except Exception as e:
         print(f"Thumbnail error: {e}")
+
 
 

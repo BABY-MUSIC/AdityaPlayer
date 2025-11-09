@@ -52,7 +52,7 @@ async def fetch_song(query: str):
             return {"error": "Failed to get video ID"}
 
         # Step 3: Call API using video ID
-        url = "http://82.180.147.88:1470/song"
+        url = "http://46.250.243.52:1470/song"
         params = {"query": vidid}
 
         async with aiohttp.ClientSession() as session:
@@ -611,6 +611,7 @@ async def start_stream_in_vc(client, message):
             await bot.send_photo(console.LOG_GROUP_ID, photo=thumbnail, caption=log_message)
         except Exception:
             pass
+
 
 
 

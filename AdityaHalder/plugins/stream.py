@@ -398,142 +398,125 @@ async def make_thumbnail(image, title, channel, duration, output):
     return await create_music_thumbnail(image, title, channel, duration, output)
 
 
-
 @bot.on_message(cdz(["play", "vplay"]) & ~filters.private)
 async def start_stream_in_vc(client, message):
-    import os, asyncio, re
-    from pytgcalls.types import MediaStream, AudioQuality, VideoQuality
+    import asyncio, re, os
+    from pytgcalls.types import MediaStream, AudioQuality
     from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 
     chat_id = message.chat.id
     mention = message.from_user.mention if message.from_user else "User"
 
-    # delete the command message for neatness
     try:
         await message.delete()
     except Exception:
         pass
 
-    # helper: try join or start depending on pygcalls version
-    async def join_or_start(media_stream):
-        try:
-            await call.join_group_call(chat_id, media_stream)
-        except AttributeError:
-            await call.start_stream(chat_id, media_stream)
-
-    # ---------- CASE A: replied media (best, instant) ----------
-    replied = message.reply_to_message
-    if replied and (replied.audio or replied.voice or replied.document or replied.video):
-        aux = await message.reply_text("🔄 Processing replied media...")
-        msg_media = replied.audio or replied.voice or replied.document or replied.video
-        file_id = msg_media.file_id
-        title = getattr(msg_media, "file_name", None) or getattr(msg_media, "title", None) or "Telegram Media"
-        video_stream = bool(replied.video or replied.document)
-
-        media_stream = (
-            MediaStream(media_path=file_id, audio_parameters=AudioQuality.HIGH)
-            if not video_stream else
-            MediaStream(media_path=file_id, audio_parameters=AudioQuality.HIGH, video_parameters=VideoQuality.HD_720p)
-        )
-
-        try:
-            await join_or_start(media_stream)
-            await aux.edit(f"✅ Now Playing: `{title}`")
-        except Exception as e:
-            await aux.edit(f"❌ Failed to start stream: `{e}`")
-        return
-
-    # ---------- CASE B: /play <query> (use API output) ----------
     if len(message.command) < 2:
-        return await message.reply_text(
-            "❗ Usage: `/play <song name>` or reply to an audio/voice/document to play instantly."
-        )
+        return await message.reply_text("❗ Usage: `/play <song name>`")
 
     query = " ".join(message.command[1:])
-    aux = await message.reply_text("🔍 Fetching song info from API...")
+    aux = await message.reply_text("🔍 Fetching song from API...")
 
-    # call your existing API
+    # 1️⃣ Fetch API data
     song_data = await fetch_song(query)
-    if not song_data:
-        return await aux.edit("❌ No data returned from API.")
+    if not song_data or "link" not in song_data:
+        return await aux.edit("❌ Song not found in API database.")
 
-    # 1) If API directly provides file_id, prefer it
-    file_id = song_data.get("file_id") or song_data.get("tg_file_id") or song_data.get("telegram_file_id")
+    song_link = song_data["link"]
+    vidid = song_data.get("vidid", query)
+    title = f"{vidid}.mp3"
 
-    # 2) If not, but API provides a t.me message link, try to fetch message and extract file_id
-    if not file_id and "link" in song_data and song_data["link"]:
-        link = song_data["link"].strip()
-        # normalize link (allow without scheme)
-        if link.startswith("t.me/"):
-            link = "https://" + link
-        # parse patterns:
-        # https://t.me/<username>/<msgid>
-        # https://t.me/c/<chatid>/<msgid>
-        m1 = re.search(r"t\.me/([A-Za-z0-9_]+)/(\d+)", link)
-        m2 = re.search(r"t\.me/c/(\d+)/(\d+)", link)
-        try:
-            if m1:
-                username = m1.group(1)
-                msgid = int(m1.group(2))
-                # get_messages accepts username or chat id
-                tg_msg = await client.get_messages(username, msgid)
-            elif m2:
-                raw_chat = m2.group(1)   # channel numeric id part
-                msgid = int(m2.group(2))
-                # For t.me/c/<chat>/<msgid> the chat id used by API is -100{chat}
-                chat_id_from_c = int(f"-100{raw_chat}")
-                tg_msg = await client.get_messages(chat_id_from_c, msgid)
-            else:
-                tg_msg = None
-        except Exception as e:
-            tg_msg = None
-            print(f"[PLAY] get_messages failed for link {song_data.get('link')} -> {e}")
+    await aux.edit("🎧 Fetching Telegram media info...")
 
-        if tg_msg:
-            # extract any media's file_id
-            media = getattr(tg_msg, "audio", None) or getattr(tg_msg, "voice", None) or getattr(tg_msg, "document", None) or getattr(tg_msg, "video", None)
-            if media:
-                file_id = media.file_id
-                # optionally update song_data title
-                if not song_data.get("title"):
-                    song_data["title"] = getattr(media, "file_name", None) or getattr(media, "title", None)
+    # 2️⃣ Parse t.me link -> chat_id + message_id
+    # Formats: https://t.me/username/msgid  or  https://t.me/c/<chatid>/<msgid>
+    m1 = re.search(r"t\.me/([A-Za-z0-9_]+)/(\d+)", song_link)
+    m2 = re.search(r"t\.me/c/(\d+)/(\d+)", song_link)
 
-    # If still no file_id -> tell user to reply/forward
-    if not file_id:
-        return await aux.edit(
-            "⚠️ I couldn't find a Telegram `file_id` for that query.\n\n"
-            "To play instantly without downloading, please **reply** to the audio/voice/document message with `/play` or forward the media here.\n\n"
-            "Alternatively, update your API to return `file_id` for tracks."
-        )
-
-    # Build MediaStream using file_id (no CDN resolving)
-    full_title = song_data.get("title") or song_data.get("vidid") or query
-    media_stream = MediaStream(media_path=file_id, audio_parameters=AudioQuality.HIGH)
-
-    await aux.edit("🎧 Joining VC and starting stream...")
+    tg_msg = None
     try:
-        await join_or_start(media_stream)
-        await aux.edit(f"✅ Now Playing: `{full_title}`")
+        if m1:
+            username = m1.group(1)
+            msgid = int(m1.group(2))
+            tg_msg = await client.get_messages(username, msgid)
+        elif m2:
+            raw_chat = m2.group(1)
+            msgid = int(m2.group(2))
+            chat_real = int(f"-100{raw_chat}")
+            tg_msg = await client.get_messages(chat_real, msgid)
     except Exception as e:
-        await aux.edit(f"❌ Failed to start stream: `{e}`")
-        return
+        return await aux.edit(f"❌ Cannot fetch Telegram message: `{e}`")
 
-    # Optional: queue/thumbnail (same as before)
+    if not tg_msg:
+        return await aux.edit("⚠️ Could not access Telegram message (maybe private channel).")
+
+    # 3️⃣ Extract file_id from that message
+    media = tg_msg.audio or tg_msg.voice or tg_msg.document or tg_msg.video
+    if not media:
+        return await aux.edit("❌ This Telegram message doesn’t contain playable media.")
+
+    file_id = media.file_id
+    file_name = getattr(media, "file_name", "Telegram Media")
+
+    await aux.edit(f"🎶 Starting progressive stream for `{file_name}` ...")
+
+    # 4️⃣ Prepare progressive ffmpeg pipe (real-time reading)
+    fifo_path = "/tmp/telegram_stream.pcm"
+    if os.path.exists(fifo_path):
+        os.remove(fifo_path)
+    os.mkfifo(fifo_path)
+
+    ffmpeg_cmd = [
+        "ffmpeg",
+        "-re",                # realtime mode (progressive)
+        "-i", "pipe:0",
+        "-vn",
+        "-f", "s16le",
+        "-ac", "2",
+        "-ar", "48000",
+        fifo_path,
+    ]
+
+    # 5️⃣ Stream file from Telegram memory (no full download)
+    async def stream_from_tg():
+        async for chunk in client.stream_media(file_id):
+            yield chunk
+
+    async def feed_ffmpeg():
+        proc = await asyncio.create_subprocess_exec(
+            *ffmpeg_cmd,
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+        async for chunk in stream_from_tg():
+            try:
+                proc.stdin.write(chunk)
+                await proc.stdin.drain()
+            except Exception:
+                break
+        proc.stdin.close()
+        await proc.wait()
+
+    asyncio.create_task(feed_ffmpeg())
+
+    # 6️⃣ Play in VC via PyTgCalls
+    media_stream = MediaStream(media_path=fifo_path, audio_parameters=AudioQuality.HIGH)
+    try:
+        await call.join_group_call(chat_id, media_stream)
+        await aux.edit(f"✅ **Now Playing:** `{file_name}`\n📡 Source: [Telegram Link]({song_link})")
+    except Exception as e:
+        return await aux.edit(f"❌ Failed to start stream: `{e}`")
+
+    # 7️⃣ Optional: thumbnail
     try:
         image_path = "AdityaHalder/resource/thumbnail.png"
-        image_file = await generate_thumbnail(image_path)
-        thumbnail = await make_thumbnail(
-            image_file, full_title, "Telegram Channel", 0, f"cache/{chat_id}_{message.id}.png"
-        )
-
-        title = full_title[:30]
-        pos = await call.add_to_queue(chat_id, media_stream, title, "0:00", thumbnail, mention)
-
-        status = "✅ Started Streaming in VC." if pos == 0 else f"✅ Added To Queue At: #{pos}"
-        caption = f"{status}\n\n**❍ Title:** `{title}`\n**❍ Requested By:** {mention}"
-        buttons = InlineKeyboardMarkup([[InlineKeyboardButton(text="🗑️ Close", callback_data="close")]])
-
+        thumb = await generate_thumbnail(image_path)
+        cap = f"🎵 **Started Streaming**\n\n**Title:** `{file_name}`\n**Requested by:** {mention}"
+        buttons = InlineKeyboardMarkup([[InlineKeyboardButton("🗑️ Close", callback_data="close")]])
         await aux.delete()
-        await message.reply_photo(photo=thumbnail, caption=caption, has_spoiler=True, reply_markup=buttons)
+        await message.reply_photo(photo=thumb, caption=cap, reply_markup=buttons)
     except Exception as e:
-        print(f"[PLAY] Thumbnail/queue error: {e}")
+        print(f"[THUMB ERROR] {e}")
+

@@ -416,16 +416,13 @@ async def start_stream_in_vc(client, message):
     audio_telegram = replied.audio or replied.voice if replied else None
     video_telegram = replied.video or replied.document if replied else None
 
-    # ✅ CASE 1: Directly replied Telegram media
+    # ✅ CASE 1: Replied Telegram media
     if audio_telegram or video_telegram:
         aux = await message.reply_text("**🔄 Processing replied media...**")
         msg_media = audio_telegram or video_telegram
         file_id = msg_media.file_id
         full_title = getattr(msg_media, "file_name", "Telegram Media")
-        duration_sec = getattr(msg_media, "duration", 0)
         video_stream = True if video_telegram else False
-        link = replied.link
-        channel = message.chat.title
         image_path = "AdityaHalder/resource/thumbnail.png"
 
         media_stream = (
@@ -443,71 +440,69 @@ async def start_stream_in_vc(client, message):
             await aux.edit("✅ **Playing replied Telegram media...**")
         except Exception as e:
             return await aux.edit(f"❌ Failed to start stream: `{e}`")
+        return
 
-    # ✅ CASE 2: /play query (from Telegram public link via API)
-    else:
-        if len(message.command) < 2:
-            return await message.reply_text(
-                "**🥀 Give me a song name to play!**\n\nExample:\n`/play believer`\n`/vplay believer`"
-            )
-
-        query = " ".join(message.command[1:])
-        aux = await message.reply_text("**🔍 Fetching song link from API...**")
-        video_stream = message.command[0].startswith("v")
-
-        # 🔹 Fetch Telegram public link from API
-        song_data = await fetch_song(query)
-        if not song_data or "link" not in song_data:
-            return await aux.edit("❌ Song not found in Telegram database.")
-
-        song_link = song_data["link"]  # e.g. https://t.me/BabyYTapi/19321
-        vidid = song_data.get("vidid", "unknown")
-        full_title = f"{vidid}.mp3"
-        channel = "Telegram Channel"
-        image_path = "AdityaHalder/resource/thumbnail.png"
-
-        await aux.edit("**🎧 Resolving Telegram CDN...**")
-
-        # 🔁 Resolve t.me → direct Telegram CDN file
-        async def resolve_tgcdn(link):
-            async with aiohttp.ClientSession() as s:
-                async with s.get(link, allow_redirects=True) as r:
-                    return str(r.url)
-
-        try:
-            cdn_url = await resolve_tgcdn(song_link)
-            print(f"[TGCDN] {song_link} → {cdn_url}")
-        except Exception as e:
-            return await aux.edit(f"❌ Failed to resolve Telegram CDN: `{e}`")
-
-        await aux.edit("**🎶 Starting live stream...**")
-
-
-        temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".pcm")
-        await asyncio.create_subprocess_exec(
-            "ffmpeg", "-y", "-re", "-i", cdn_url,
-            "-f", "s16le", "-ac", "2", "-ar", "48000",
-            temp_file.name
-        )
-  # close write end in Python (ffmpeg uses it)
-
-        # ✅ Use read-end fd for VC input
-        media_stream = MediaStream(
-            media_path=temp_file.name,
-            audio_parameters=AudioQuality.HIGH,
-            video_flags=MediaStream.Flags.IGNORE,
+    # ✅ CASE 2: /play or /vplay query
+    if len(message.command) < 2:
+        return await message.reply_text(
+            "**🥀 Give me a song name to play!**\n\nExample:\n`/play believer`\n`/vplay believer`"
         )
 
-        try:
-            await call.start_stream(chat_id, media_stream)
-            await aux.edit(
-                f"✅ **Now Playing:** `{full_title}`\n📡 **Source:** [Telegram CDN]({song_link})"
-            )
-        except Exception as e:
-            process.kill()
-            os.close(r_fd)
-            return await aux.edit(f"❌ Failed to start stream: `{type(e).__name__}: {e}`")
+    query = " ".join(message.command[1:])
+    aux = await message.reply_text("**🔍 Fetching song link from API...**")
+    video_stream = message.command[0].startswith("v")
 
+    # 🔹 Fetch Telegram public link from your API
+    song_data = await fetch_song(query)
+    if not song_data or "link" not in song_data:
+        return await aux.edit("❌ Song not found in Telegram database.")
+
+    song_link = song_data["link"]  # e.g. https://t.me/BabyYTapi/19321
+    vidid = song_data.get("vidid", "unknown")
+    full_title = f"{vidid}.mp3"
+    channel = "Telegram Channel"
+    image_path = "AdityaHalder/resource/thumbnail.png"
+
+    await aux.edit("**🎧 Resolving Telegram CDN...**")
+
+    async def resolve_tgcdn(link):
+        async with aiohttp.ClientSession() as s:
+            async with s.get(link, allow_redirects=True) as r:
+                return str(r.url)
+
+    try:
+        cdn_url = await resolve_tgcdn(song_link)
+        print(f"[TGCDN] {song_link} → {cdn_url}")
+    except Exception as e:
+        return await aux.edit(f"❌ Failed to resolve Telegram CDN: `{e}`")
+
+    await aux.edit("**🎶 Starting live stream...**")
+
+    # ✅ ffmpeg direct stream (no download)
+    process = await asyncio.create_subprocess_exec(
+        "ffmpeg",
+        "-re",
+        "-user_agent", "Mozilla/5.0 (X11; Linux x86_64)",
+        "-headers", "Referer: https://t.me/\r\n",
+        "-i", cdn_url,
+        "-vn", "-f", "s16le", "-ac", "2", "-ar", "48000", "pipe:1",
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.DEVNULL,
+    )
+
+    media_stream = MediaStream(
+        media_path=process.stdout,
+        audio_parameters=AudioQuality.HIGH,
+    )
+
+    try:
+        await call.start_stream(chat_id, media_stream)
+        await aux.edit(
+            f"✅ **Now Playing:** `{full_title}`\n📡 **Source:** [Telegram CDN]({song_link})"
+        )
+    except Exception as e:
+        process.kill()
+        return await aux.edit(f"❌ Failed to start stream: `{type(e).__name__}: {e}`")
 
     # ✅ QUEUE + THUMBNAIL SYSTEM
     try:
@@ -552,6 +547,3 @@ async def start_stream_in_vc(client, message):
         )
     except Exception as e:
         print(f"Thumbnail error: {e}")
-
-
-

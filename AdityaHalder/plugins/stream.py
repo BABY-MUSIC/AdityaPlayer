@@ -401,6 +401,12 @@ async def make_thumbnail(image, title, channel, duration, output):
 
 @bot.on_message(cdz(["play", "vplay"]) & ~filters.private)
 async def start_stream_in_vc(client, message):
+    import os
+    import tempfile
+    import asyncio
+    from pytgcalls.types import MediaStream, AudioQuality, VideoQuality
+    from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+
     try:
         await message.delete()
     except Exception:
@@ -416,14 +422,13 @@ async def start_stream_in_vc(client, message):
     audio_telegram = replied.audio or replied.voice if replied else None
     video_telegram = replied.video or replied.document if replied else None
 
-    # ✅ CASE 1: Replied Telegram media
+    # ✅ CASE 1: Direct Telegram Media
     if audio_telegram or video_telegram:
         aux = await message.reply_text("**🔄 Processing replied media...**")
         msg_media = audio_telegram or video_telegram
         file_id = msg_media.file_id
         full_title = getattr(msg_media, "file_name", "Telegram Media")
         video_stream = True if video_telegram else False
-        image_path = "AdityaHalder/resource/thumbnail.png"
 
         media_stream = (
             MediaStream(media_path=file_id, audio_parameters=AudioQuality.HIGH)
@@ -442,7 +447,7 @@ async def start_stream_in_vc(client, message):
             return await aux.edit(f"❌ Failed to start stream: `{e}`")
         return
 
-    # ✅ CASE 2: /play or /vplay query
+    # ✅ CASE 2: /play query (from API)
     if len(message.command) < 2:
         return await message.reply_text(
             "**🥀 Give me a song name to play!**\n\nExample:\n`/play believer`\n`/vplay believer`"
@@ -452,7 +457,7 @@ async def start_stream_in_vc(client, message):
     aux = await message.reply_text("**🔍 Fetching song link from API...**")
     video_stream = message.command[0].startswith("v")
 
-    # 🔹 Fetch Telegram public link from your API
+    # 🔹 Fetch Telegram public link via API
     song_data = await fetch_song(query)
     if not song_data or "link" not in song_data:
         return await aux.edit("❌ Song not found in Telegram database.")
@@ -461,11 +466,12 @@ async def start_stream_in_vc(client, message):
     vidid = song_data.get("vidid", "unknown")
     full_title = f"{vidid}.mp3"
     channel = "Telegram Channel"
-    image_path = "AdityaHalder/resource/thumbnail.png"
 
     await aux.edit("**🎧 Resolving Telegram CDN...**")
 
+    # Resolve to Telegram CDN direct URL
     async def resolve_tgcdn(link):
+        import aiohttp
         async with aiohttp.ClientSession() as s:
             async with s.get(link, allow_redirects=True) as r:
                 return str(r.url)
@@ -476,36 +482,49 @@ async def start_stream_in_vc(client, message):
     except Exception as e:
         return await aux.edit(f"❌ Failed to resolve Telegram CDN: `{e}`")
 
-    await aux.edit("**🎶 Starting live stream...**")
+    await aux.edit("**🎶 Starting VC live stream...**")
 
-    # ✅ ffmpeg direct stream (no download)
+    # 🔹 Create FIFO named pipe
+    fifo_path = "/tmp/tgvc_fifo.pcm"
+    if os.path.exists(fifo_path):
+        os.remove(fifo_path)
+    os.mkfifo(fifo_path)
+
+    # 🔹 ffmpeg live pipe writer (stream → fifo)
     process = await asyncio.create_subprocess_exec(
         "ffmpeg",
         "-re",
         "-user_agent", "Mozilla/5.0 (X11; Linux x86_64)",
         "-headers", "Referer: https://t.me/\r\n",
         "-i", cdn_url,
-        "-vn", "-f", "s16le", "-ac", "2", "-ar", "48000", "pipe:1",
-        stdout=asyncio.subprocess.PIPE,
+        "-vn",
+        "-f", "s16le",
+        "-ac", "2",
+        "-ar", "48000",
+        fifo_path,
+        stdout=asyncio.subprocess.DEVNULL,
         stderr=asyncio.subprocess.DEVNULL,
     )
 
+    # 🔹 pytgcalls stream input (fifo)
     media_stream = MediaStream(
-        media_path=process.stdout,
+        media_path=fifo_path,
         audio_parameters=AudioQuality.HIGH,
     )
 
     try:
         await call.start_stream(chat_id, media_stream)
         await aux.edit(
-            f"✅ **Now Playing:** `{full_title}`\n📡 **Source:** [Telegram CDN]({song_link})"
+            f"✅ **Now Streaming:** `{full_title}`\n📡 **Source:** [Telegram CDN]({song_link})"
         )
     except Exception as e:
         process.kill()
-        return await aux.edit(f"❌ Failed to start stream: `{type(e).__name__}: {e}`")
+        os.remove(fifo_path)
+        return await aux.edit(f"❌ Stream failed: `{type(e).__name__}: {e}`")
 
-    # ✅ QUEUE + THUMBNAIL SYSTEM
+    # ✅ Optional: Queue + Thumbnail
     try:
+        image_path = "AdityaHalder/resource/thumbnail.png"
         image_file = await generate_thumbnail(image_path)
         thumbnail = await make_thumbnail(
             image_file,

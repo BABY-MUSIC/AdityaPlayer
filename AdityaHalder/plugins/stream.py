@@ -504,7 +504,7 @@ async def start_stream_in_vc(client, message):
     # 6️⃣ Play in VC via PyTgCalls
     media_stream = MediaStream(media_path=fifo_path, audio_parameters=AudioQuality.HIGH)
     try:
-        await call.join_group_call(chat_id, media_stream)
+        await call.start_stream(chat_id, media_stream)
         await aux.edit(f"✅ **Now Playing:** `{file_name}`\n📡 Source: [Telegram Link]({song_link})")
     except Exception as e:
         return await aux.edit(f"❌ Failed to start stream: `{e}`")
@@ -519,4 +519,5 @@ async def start_stream_in_vc(client, message):
         await message.reply_photo(photo=thumb, caption=cap, reply_markup=buttons)
     except Exception as e:
         print(f"[THUMB ERROR] {e}")
+
 

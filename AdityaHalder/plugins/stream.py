@@ -401,168 +401,139 @@ async def make_thumbnail(image, title, channel, duration, output):
 
 @bot.on_message(cdz(["play", "vplay"]) & ~filters.private)
 async def start_stream_in_vc(client, message):
-    import os
-    import tempfile
-    import asyncio
+    import os, asyncio, re
     from pytgcalls.types import MediaStream, AudioQuality, VideoQuality
     from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 
+    chat_id = message.chat.id
+    mention = message.from_user.mention if message.from_user else "User"
+
+    # delete the command message for neatness
     try:
         await message.delete()
     except Exception:
         pass
 
-    chat_id = message.chat.id
-    mention = (
-        message.from_user.mention
-        if message.from_user
-        else f"[Anonymous User](https://t.me/{bot.username})"
-    )
-    replied = message.reply_to_message
-    audio_telegram = replied.audio or replied.voice if replied else None
-    video_telegram = replied.video or replied.document if replied else None
+    # helper: try join or start depending on pygcalls version
+    async def join_or_start(media_stream):
+        try:
+            await call.join_group_call(chat_id, media_stream)
+        except AttributeError:
+            await call.start_stream(chat_id, media_stream)
 
-    # ✅ CASE 1: Direct Telegram Media
-    if audio_telegram or video_telegram:
-        aux = await message.reply_text("**🔄 Processing replied media...**")
-        msg_media = audio_telegram or video_telegram
+    # ---------- CASE A: replied media (best, instant) ----------
+    replied = message.reply_to_message
+    if replied and (replied.audio or replied.voice or replied.document or replied.video):
+        aux = await message.reply_text("🔄 Processing replied media...")
+        msg_media = replied.audio or replied.voice or replied.document or replied.video
         file_id = msg_media.file_id
-        full_title = getattr(msg_media, "file_name", "Telegram Media")
-        video_stream = True if video_telegram else False
+        title = getattr(msg_media, "file_name", None) or getattr(msg_media, "title", None) or "Telegram Media"
+        video_stream = bool(replied.video or replied.document)
 
         media_stream = (
             MediaStream(media_path=file_id, audio_parameters=AudioQuality.HIGH)
-            if not video_stream
-            else MediaStream(
-                media_path=file_id,
-                audio_parameters=AudioQuality.HIGH,
-                video_parameters=VideoQuality.HD_720p,
-            )
+            if not video_stream else
+            MediaStream(media_path=file_id, audio_parameters=AudioQuality.HIGH, video_parameters=VideoQuality.HD_720p)
         )
 
         try:
-            await call.start_stream(chat_id, media_stream)
-            await aux.edit("✅ **Playing replied Telegram media...**")
+            await join_or_start(media_stream)
+            await aux.edit(f"✅ Now Playing: `{title}`")
         except Exception as e:
-            return await aux.edit(f"❌ Failed to start stream: `{e}`")
+            await aux.edit(f"❌ Failed to start stream: `{e}`")
         return
 
-    # ✅ CASE 2: /play query (from API)
+    # ---------- CASE B: /play <query> (use API output) ----------
     if len(message.command) < 2:
         return await message.reply_text(
-            "**🥀 Give me a song name to play!**\n\nExample:\n`/play believer`\n`/vplay believer`"
+            "❗ Usage: `/play <song name>` or reply to an audio/voice/document to play instantly."
         )
 
     query = " ".join(message.command[1:])
-    aux = await message.reply_text("**🔍 Fetching song link from API...**")
-    video_stream = message.command[0].startswith("v")
+    aux = await message.reply_text("🔍 Fetching song info from API...")
 
-    # 🔹 Fetch Telegram public link via API
+    # call your existing API
     song_data = await fetch_song(query)
-    if not song_data or "link" not in song_data:
-        return await aux.edit("❌ Song not found in Telegram database.")
+    if not song_data:
+        return await aux.edit("❌ No data returned from API.")
 
-    song_link = song_data["link"]  # e.g. https://t.me/BabyYTapi/19321
-    vidid = song_data.get("vidid", "unknown")
-    full_title = f"{vidid}.mp3"
-    channel = "Telegram Channel"
+    # 1) If API directly provides file_id, prefer it
+    file_id = song_data.get("file_id") or song_data.get("tg_file_id") or song_data.get("telegram_file_id")
 
-    await aux.edit("**🎧 Resolving Telegram CDN...**")
+    # 2) If not, but API provides a t.me message link, try to fetch message and extract file_id
+    if not file_id and "link" in song_data and song_data["link"]:
+        link = song_data["link"].strip()
+        # normalize link (allow without scheme)
+        if link.startswith("t.me/"):
+            link = "https://" + link
+        # parse patterns:
+        # https://t.me/<username>/<msgid>
+        # https://t.me/c/<chatid>/<msgid>
+        m1 = re.search(r"t\.me/([A-Za-z0-9_]+)/(\d+)", link)
+        m2 = re.search(r"t\.me/c/(\d+)/(\d+)", link)
+        try:
+            if m1:
+                username = m1.group(1)
+                msgid = int(m1.group(2))
+                # get_messages accepts username or chat id
+                tg_msg = await client.get_messages(username, msgid)
+            elif m2:
+                raw_chat = m2.group(1)   # channel numeric id part
+                msgid = int(m2.group(2))
+                # For t.me/c/<chat>/<msgid> the chat id used by API is -100{chat}
+                chat_id_from_c = int(f"-100{raw_chat}")
+                tg_msg = await client.get_messages(chat_id_from_c, msgid)
+            else:
+                tg_msg = None
+        except Exception as e:
+            tg_msg = None
+            print(f"[PLAY] get_messages failed for link {song_data.get('link')} -> {e}")
 
-    # Resolve to Telegram CDN direct URL
-    async def resolve_tgcdn(link):
-        import aiohttp
-        async with aiohttp.ClientSession() as s:
-            async with s.get(link, allow_redirects=True) as r:
-                return str(r.url)
+        if tg_msg:
+            # extract any media's file_id
+            media = getattr(tg_msg, "audio", None) or getattr(tg_msg, "voice", None) or getattr(tg_msg, "document", None) or getattr(tg_msg, "video", None)
+            if media:
+                file_id = media.file_id
+                # optionally update song_data title
+                if not song_data.get("title"):
+                    song_data["title"] = getattr(media, "file_name", None) or getattr(media, "title", None)
 
-    try:
-        cdn_url = await resolve_tgcdn(song_link)
-        print(f"[TGCDN] {song_link} → {cdn_url}")
-    except Exception as e:
-        return await aux.edit(f"❌ Failed to resolve Telegram CDN: `{e}`")
-
-    await aux.edit("**🎶 Starting VC live stream...**")
-
-    # 🔹 Create FIFO named pipe
-    fifo_path = "/tmp/tgvc_fifo.pcm"
-    if os.path.exists(fifo_path):
-        os.remove(fifo_path)
-    os.mkfifo(fifo_path)
-
-    # 🔹 ffmpeg live pipe writer (stream → fifo)
-    process = await asyncio.create_subprocess_exec(
-        "ffmpeg",
-        "-re",
-        "-user_agent", "Mozilla/5.0 (X11; Linux x86_64)",
-        "-headers", "Referer: https://t.me/\r\n",
-        "-i", cdn_url,
-        "-vn",
-        "-f", "s16le",
-        "-ac", "2",
-        "-ar", "48000",
-        fifo_path,
-        stdout=asyncio.subprocess.DEVNULL,
-        stderr=asyncio.subprocess.DEVNULL,
-    )
-
-    # 🔹 pytgcalls stream input (fifo)
-    media_stream = MediaStream(
-        media_path=fifo_path,
-        audio_parameters=AudioQuality.HIGH,
-    )
-
-    try:
-        await call.start_stream(chat_id, media_stream)
-        await aux.edit(
-            f"✅ **Now Streaming:** `{full_title}`\n📡 **Source:** [Telegram CDN]({song_link})"
+    # If still no file_id -> tell user to reply/forward
+    if not file_id:
+        return await aux.edit(
+            "⚠️ I couldn't find a Telegram `file_id` for that query.\n\n"
+            "To play instantly without downloading, please **reply** to the audio/voice/document message with `/play` or forward the media here.\n\n"
+            "Alternatively, update your API to return `file_id` for tracks."
         )
-    except Exception as e:
-        process.kill()
-        os.remove(fifo_path)
-        return await aux.edit(f"❌ Stream failed: `{type(e).__name__}: {e}`")
 
-    # ✅ Optional: Queue + Thumbnail
+    # Build MediaStream using file_id (no CDN resolving)
+    full_title = song_data.get("title") or song_data.get("vidid") or query
+    media_stream = MediaStream(media_path=file_id, audio_parameters=AudioQuality.HIGH)
+
+    await aux.edit("🎧 Joining VC and starting stream...")
+    try:
+        await join_or_start(media_stream)
+        await aux.edit(f"✅ Now Playing: `{full_title}`")
+    except Exception as e:
+        await aux.edit(f"❌ Failed to start stream: `{e}`")
+        return
+
+    # Optional: queue/thumbnail (same as before)
     try:
         image_path = "AdityaHalder/resource/thumbnail.png"
         image_file = await generate_thumbnail(image_path)
         thumbnail = await make_thumbnail(
-            image_file,
-            full_title,
-            channel,
-            0,
-            f"cache/{chat_id}_{message.id}.png",
+            image_file, full_title, "Telegram Channel", 0, f"cache/{chat_id}_{message.id}.png"
         )
 
         title = full_title[:30]
-        pos = await call.add_to_queue(
-            chat_id, media_stream, title, "0:00", thumbnail, mention
-        )
+        pos = await call.add_to_queue(chat_id, media_stream, title, "0:00", thumbnail, mention)
 
-        status = (
-            "✅ **Started Streaming in VC.**"
-            if pos == 0
-            else f"✅ **Added To Queue At: #{pos}**"
-        )
-
-        caption = f"""
-{status}
-
-**❍ Title:** `{title}`
-**❍ Requested By:** {mention}
-**❍ Source:** [Telegram Link]({song_link})
-"""
-
-        buttons = InlineKeyboardMarkup(
-            [[InlineKeyboardButton(text="🗑️ Close", callback_data="close")]]
-        )
+        status = "✅ Started Streaming in VC." if pos == 0 else f"✅ Added To Queue At: #{pos}"
+        caption = f"{status}\n\n**❍ Title:** `{title}`\n**❍ Requested By:** {mention}"
+        buttons = InlineKeyboardMarkup([[InlineKeyboardButton(text="🗑️ Close", callback_data="close")]])
 
         await aux.delete()
-        await message.reply_photo(
-            photo=thumbnail,
-            caption=caption,
-            has_spoiler=True,
-            reply_markup=buttons,
-        )
+        await message.reply_photo(photo=thumbnail, caption=caption, has_spoiler=True, reply_markup=buttons)
     except Exception as e:
-        print(f"Thumbnail error: {e}")
+        print(f"[PLAY] Thumbnail/queue error: {e}")

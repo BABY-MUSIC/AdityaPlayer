@@ -400,7 +400,7 @@ async def make_thumbnail(image, title, channel, duration, output):
 
 @bot.on_message(cdz(["play", "vplay"]) & ~filters.private)
 async def start_stream_in_vc(client, message):
-    import asyncio, re, os, traceback, pytgcalls.ffmpeg
+    import os, re, asyncio, traceback
     from pytgcalls.types import MediaStream, AudioQuality
     from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 
@@ -412,14 +412,13 @@ async def start_stream_in_vc(client, message):
     except Exception:
         pass
 
-    # ✅ Step 1: Query check
+    # 🔹 Step 1: API से डेटा लाओ
     if len(message.command) < 2:
-        return await message.reply_text("❗ Usage: `/play <song name>`")
+        return await message.reply_text("❗Usage: `/play <song name>`")
 
     query = " ".join(message.command[1:])
     aux = await message.reply_text("🔍 Fetching song info from API...")
 
-    # ✅ Step 2: Fetch song data from your API
     try:
         song_data = await fetch_song(query)
     except Exception as e:
@@ -427,7 +426,7 @@ async def start_stream_in_vc(client, message):
         return await aux.edit(f"❌ API error: `{e}`\n\n<code>{tb}</code>")
 
     if not song_data or "link" not in song_data:
-        return await aux.edit("❌ No valid song found in API database.")
+        return await aux.edit("❌ Song not found in API database.")
 
     song_link = song_data["link"]
     vidid = song_data.get("vidid", query)
@@ -435,7 +434,7 @@ async def start_stream_in_vc(client, message):
 
     await aux.edit("🎧 Fetching Telegram message...")
 
-    # ✅ Step 3: Parse Telegram message link
+    # 🔹 Step 2: Telegram link से message निकालो
     m1 = re.search(r"t\.me/([A-Za-z0-9_]+)/(\d+)", song_link)
     m2 = re.search(r"t\.me/c/(\d+)/(\d+)", song_link)
     tg_msg = None
@@ -455,105 +454,61 @@ async def start_stream_in_vc(client, message):
         return await aux.edit(f"❌ Failed to fetch Telegram message: `{e}`\n\n<code>{tb}</code>")
 
     if not tg_msg:
-        return await aux.edit("⚠️ Could not access Telegram message (maybe private or deleted).")
+        return await aux.edit("⚠️ Could not access Telegram message (maybe private).")
 
-    # ✅ Step 4: Extract file_id
+    # 🔹 Step 3: File download temporarily
     media = tg_msg.audio or tg_msg.voice or tg_msg.document or tg_msg.video
     if not media:
         return await aux.edit("❌ This Telegram message doesn’t contain playable media.")
-    file_id = media.file_id
-    file_name = getattr(media, "file_name", "Telegram Media")
 
-    await aux.edit(f"🎶 Starting progressive stream for `{file_name}`...")
+    file_name = getattr(media, "file_name", "TelegramMedia")
+    temp_path = f"/tmp/{file_name}"
 
-    # ✅ Step 5: Create FIFO pipe
-    fifo_path = "/tmp/progressive_stream.pcm"
-    if os.path.exists(fifo_path):
-        os.remove(fifo_path)
-    os.mkfifo(fifo_path)
+    await aux.edit(f"⬇️ Downloading `{file_name}` from Telegram...")
+    try:
+        await client.download_media(media, file_name=temp_path)
+    except Exception as e:
+        tb = traceback.format_exc()
+        return await aux.edit(f"❌ Download failed: `{e}`\n\n<code>{tb}</code>")
 
-    # ✅ Step 6: ffmpeg command (progressive mode)
-    ffmpeg_cmd = [
-        "ffmpeg",
-        "-re",
-        "-i", "pipe:0",
-        "-vn",
-        "-f", "s16le",
-        "-ac", "2",
-        "-ar", "48000",
-        fifo_path,
-    ]
-
-    # ✅ Step 7: Telegram stream (progressive chunks)
-    async def stream_from_tg():
-        async for chunk in client.stream_media(file_id):
-            yield chunk
-
-    async def feed_ffmpeg():
-        try:
-            proc = await asyncio.create_subprocess_exec(
-                *ffmpeg_cmd,
-                stdin=asyncio.subprocess.PIPE,
-                stdout=asyncio.subprocess.DEVNULL,
-                stderr=asyncio.subprocess.DEVNULL,
-            )
-
-            async for chunk in stream_from_tg():
-                if proc.returncode is not None:
-                    print("[FFMPEG] Process exited early.")
-                    break
-                try:
-                    proc.stdin.write(chunk)
-                    await proc.stdin.drain()
-                except (BrokenPipeError, ConnectionResetError):
-                    print("[FFMPEG] Pipe closed, stopping feed.")
-                    break
-
-            try:
-                proc.stdin.close()
-            except Exception:
-                pass
-            await proc.wait()
-        except Exception as e:
-            print(f"[FFMPEG ERROR] {e}")
-
-    # Background ffmpeg feeder
-    feed_task = asyncio.create_task(feed_ffmpeg())
-
-    # ✅ Step 8: Give ffmpeg buffer time before VC start
-    await asyncio.sleep(2)
-    pytgcalls.ffmpeg.TIMEOUT = 20  # increase default timeout
-
-    # ✅ Step 9: Start streaming in VC
-    stream = MediaStream(media_path=fifo_path, audio_parameters=AudioQuality.HIGH)
+    # 🔹 Step 4: VC Stream Start
+    await aux.edit("🎶 Starting Voice Chat stream...")
 
     try:
+        from pytgcalls.types import MediaStream, AudioQuality
+        media_stream = MediaStream(
+            media_path=temp_path,
+            audio_parameters=AudioQuality.HIGH,
+        )
         try:
             await call.stop_stream(chat_id)
         except Exception:
             pass
 
-        await call.start_stream(chat_id, stream)
-        await aux.edit(
-            f"✅ **Now Playing:** `{file_name}`\n📡 [Telegram Link]({song_link})"
-        )
+        await call.start_stream(chat_id, media_stream)
+        await aux.edit(f"✅ **Now Playing:** `{file_name}`\n📡 [Telegram Link]({song_link})")
+
     except Exception as e:
         tb = traceback.format_exc()
         return await aux.edit(f"❌ Failed to start stream: `{e}`\n\n<code>{tb}</code>")
-    finally:
-        # FIFO cleanup if needed later
-        if os.path.exists(fifo_path):
-            try:
-                os.remove(fifo_path)
-            except Exception:
-                pass
 
-    # ✅ Step 10: Optional Thumbnail + Buttons
+    # 🔹 Step 5: Auto-delete after stream
+    async def auto_delete():
+        await asyncio.sleep(30)
+        try:
+            os.remove(temp_path)
+            print(f"[CLEANUP] Deleted temp file: {temp_path}")
+        except Exception:
+            pass
+
+    asyncio.create_task(auto_delete())
+
+    # 🔹 Step 6: Optional Thumbnail UI
     try:
         image_path = "AdityaHalder/resource/thumbnail.png"
         thumb = await generate_thumbnail(image_path)
         caption = (
-            f"🎵 **Streaming in VC (Progressive)**\n\n"
+            f"🎵 **Streaming in VC**\n\n"
             f"**Title:** `{file_name}`\n"
             f"**Requested by:** {mention}\n"
             f"**Source:** [Telegram Link]({song_link})"

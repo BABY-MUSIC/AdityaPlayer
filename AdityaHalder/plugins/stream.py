@@ -400,8 +400,8 @@ async def make_thumbnail(image, title, channel, duration, output):
 
 @bot.on_message(cdz(["play", "vplay"]) & ~filters.private)
 async def start_stream_in_vc(client, message):
-    import asyncio, re, os
-    from pytgcalls.types import MediaStream, AudioQuality
+    import asyncio, re, os, traceback
+    from pytgcalls.types import MediaStream, AudioQuality, VideoQuality
     from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 
     chat_id = message.chat.id
@@ -412,14 +412,20 @@ async def start_stream_in_vc(client, message):
     except Exception:
         pass
 
+    # ✅ Step 1: Query check
     if len(message.command) < 2:
         return await message.reply_text("❗ Usage: `/play <song name>`")
 
     query = " ".join(message.command[1:])
-    aux = await message.reply_text("🔍 Fetching song from API...")
+    aux = await message.reply_text("🔍 Fetching song info from API...")
 
-    # 1️⃣ Fetch API data
-    song_data = await fetch_song(query)
+    # ✅ Step 2: API fetch
+    try:
+        song_data = await fetch_song(query)
+    except Exception as e:
+        tb = traceback.format_exc()
+        return await aux.edit(f"❌ API request failed: `{e}`\n\n<code>{tb}</code>")
+
     if not song_data or "link" not in song_data:
         return await aux.edit("❌ Song not found in API database.")
 
@@ -427,13 +433,11 @@ async def start_stream_in_vc(client, message):
     vidid = song_data.get("vidid", query)
     title = f"{vidid}.mp3"
 
-    await aux.edit("🎧 Fetching Telegram media info...")
+    await aux.edit("🎧 Fetching Telegram message...")
 
-    # 2️⃣ Parse t.me link -> chat_id + message_id
-    # Formats: https://t.me/username/msgid  or  https://t.me/c/<chatid>/<msgid>
+    # ✅ Step 3: Extract chat_id & message_id from t.me link
     m1 = re.search(r"t\.me/([A-Za-z0-9_]+)/(\d+)", song_link)
     m2 = re.search(r"t\.me/c/(\d+)/(\d+)", song_link)
-
     tg_msg = None
     try:
         if m1:
@@ -446,30 +450,31 @@ async def start_stream_in_vc(client, message):
             chat_real = int(f"-100{raw_chat}")
             tg_msg = await client.get_messages(chat_real, msgid)
     except Exception as e:
-        return await aux.edit(f"❌ Cannot fetch Telegram message: `{e}`")
+        tb = traceback.format_exc()
+        return await aux.edit(f"❌ Failed to fetch Telegram message: `{e}`\n\n<code>{tb}</code>")
 
     if not tg_msg:
-        return await aux.edit("⚠️ Could not access Telegram message (maybe private channel).")
+        return await aux.edit("⚠️ Cannot access Telegram message (private or deleted).")
 
-    # 3️⃣ Extract file_id from that message
+    # ✅ Step 4: Extract media file_id
     media = tg_msg.audio or tg_msg.voice or tg_msg.document or tg_msg.video
     if not media:
-        return await aux.edit("❌ This Telegram message doesn’t contain playable media.")
-
+        return await aux.edit("❌ This Telegram message doesn’t contain audio or video.")
     file_id = media.file_id
     file_name = getattr(media, "file_name", "Telegram Media")
 
-    await aux.edit(f"🎶 Starting progressive stream for `{file_name}` ...")
+    await aux.edit(f"🎶 Starting progressive stream for `{file_name}`...")
 
-    # 4️⃣ Prepare progressive ffmpeg pipe (real-time reading)
-    fifo_path = "/tmp/telegram_stream.pcm"
+    # ✅ Step 5: Create FIFO pipe for ffmpeg
+    fifo_path = "/tmp/progressive_stream.pcm"
     if os.path.exists(fifo_path):
         os.remove(fifo_path)
     os.mkfifo(fifo_path)
 
+    # ffmpeg realtime decode (progressive)
     ffmpeg_cmd = [
         "ffmpeg",
-        "-re",                # realtime mode (progressive)
+        "-re",              # read input at real-time speed
         "-i", "pipe:0",
         "-vn",
         "-f", "s16le",
@@ -478,46 +483,72 @@ async def start_stream_in_vc(client, message):
         fifo_path,
     ]
 
-    # 5️⃣ Stream file from Telegram memory (no full download)
+    # ✅ Step 6: Stream from Telegram (progressive)
     async def stream_from_tg():
         async for chunk in client.stream_media(file_id):
             yield chunk
 
     async def feed_ffmpeg():
-        proc = await asyncio.create_subprocess_exec(
-            *ffmpeg_cmd,
-            stdin=asyncio.subprocess.PIPE,
-            stdout=asyncio.subprocess.DEVNULL,
-            stderr=asyncio.subprocess.DEVNULL,
-        )
-        async for chunk in stream_from_tg():
-            try:
-                proc.stdin.write(chunk)
-                await proc.stdin.drain()
-            except Exception:
-                break
-        proc.stdin.close()
-        await proc.wait()
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *ffmpeg_cmd,
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
 
+            async for chunk in stream_from_tg():
+                # अगर ffmpeg पहले बंद हो गया तो बाहर निकलो
+                if proc.returncode is not None:
+                    print("[FFMPEG] Process exited early.")
+                    break
+                try:
+                    proc.stdin.write(chunk)
+                    await proc.stdin.drain()
+                except (BrokenPipeError, ConnectionResetError):
+                    print("[FFMPEG] Pipe closed, stopping feed.")
+                    break
+
+            try:
+                proc.stdin.close()
+            except Exception:
+                pass
+            await proc.wait()
+        except Exception as e:
+            print(f"[FFMPEG ERROR] {e}")
+
+    # background task में ffmpeg feeding चलाओ
     asyncio.create_task(feed_ffmpeg())
 
-    # 6️⃣ Play in VC via PyTgCalls
-    media_stream = MediaStream(media_path=fifo_path, audio_parameters=AudioQuality.HIGH)
-    try:
-        await call.start_stream(chat_id, media_stream)
-        await aux.edit(f"✅ **Now Playing:** `{file_name}`\n📡 Source: [Telegram Link]({song_link})")
-    except Exception as e:
-        return await aux.edit(f"❌ Failed to start stream: `{e}`")
+    # ✅ Step 7: Play stream in VC
+    stream = MediaStream(media_path=fifo_path, audio_parameters=AudioQuality.HIGH)
 
-    # 7️⃣ Optional: thumbnail
+    try:
+        # पहले चल रहा stream stop करो (avoid conflict)
+        try:
+            await call.stop_stream(chat_id)
+        except Exception:
+            pass
+
+        # अब नया stream चालू करो
+        await call.start_stream(chat_id, stream)
+        await aux.edit(f"✅ **Now Playing:** `{file_name}`\n📡 [Telegram Link]({song_link})")
+    except Exception as e:
+        tb = traceback.format_exc()
+        return await aux.edit(f"❌ Failed to start stream: `{e}`\n\n<code>{tb}</code>")
+
+    # ✅ Step 8: Optional thumbnail UI
     try:
         image_path = "AdityaHalder/resource/thumbnail.png"
         thumb = await generate_thumbnail(image_path)
-        cap = f"🎵 **Started Streaming**\n\n**Title:** `{file_name}`\n**Requested by:** {mention}"
+        caption = (
+            f"🎵 **Streaming in VC (Progressive)**\n\n"
+            f"**Title:** `{file_name}`\n"
+            f"**Requested by:** {mention}\n"
+            f"**Source:** [Telegram Link]({song_link})"
+        )
         buttons = InlineKeyboardMarkup([[InlineKeyboardButton("🗑️ Close", callback_data="close")]])
         await aux.delete()
-        await message.reply_photo(photo=thumb, caption=cap, reply_markup=buttons)
+        await message.reply_photo(photo=thumb, caption=caption, reply_markup=buttons)
     except Exception as e:
         print(f"[THUMB ERROR] {e}")
-
-
